@@ -1319,11 +1319,20 @@ begin
       IN_PHASE_G    => IN_PHASE_G,
       PIPE_EN_G     => PIPE_EN_G,
       MAX_NOP_G     => MAX_NOP_G,
+      ENABLE_REFRESH_G => ENABLE_REFRESH_G,
+      MULTIPLE_ACTIVE_ROWS_G => MULTIPLE_ACTIVE_ROWS_G,
       DATA_WIDTH_G  => DATA_WIDTH_G,
       NROWS_G       => NROWS_G,
       NCOLS_G       => NCOLS_G,
       HADDR_WIDTH_G => HADDR_WIDTH_G,
-      SADDR_WIDTH_G => SADDR_WIDTH_G
+      SADDR_WIDTH_G => SADDR_WIDTH_G,
+      T_INIT_G      => T_INIT_G,
+      T_RAS_G       => T_RAS_G,
+      T_RCD_G       => T_RCD_G,
+      T_REF_G       => T_REF_G,
+      T_RFC_G       => T_RFC_G,
+      T_RP_G        => T_RP_G,
+      T_XSR_G       => T_XSR_G
       )
     port map(
       clk_i          => clk_i,  -- master clock from external clock source (unbuffered)
