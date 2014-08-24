@@ -418,7 +418,8 @@ begin
                           activeFlag_r, activeRow_r, activeBank_r, rdPipeline_r, wrPipeline_r,
                           sdramDataOppPhase_r, nopCntr_r, lock_i, rfshCntr_r, timer_r, rasTimer_r,
                           wrTimer_r, refTimer_r, cmd_r, col_s, row_s, bank_s, bankIndex_s, ba_r,
-                          cke_r, doActivate_s, doSelfRfsh_s, activateInProgress_s)
+                          ba_x, cke_r, doActivate_s, doSelfRfsh_s, activateInProgress_s,
+                          rdInProgress_s, wrInProgress_s)
   begin
 
     --*********************************************************************
