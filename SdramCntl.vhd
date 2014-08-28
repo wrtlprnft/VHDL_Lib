@@ -991,17 +991,17 @@ end entity;
 
 
 architecture arch of DualPort is
-  -- The door signal controls whether the read/write signal from the active port
-  -- is allowed through to the read/write inputs of the SDRAM controller.
-  type DoorStateType is (OPENED_C, CLOSED_C);
-  signal door_r, door_x : DoorStateType := CLOSED_C;
+  constant CAS_CYCLES_C  : natural := 3;  -- CAS latency.
 
   -- The port signal indicates which port is connected to the SDRAM controller.
   type PortStateType is (PORT0_C, PORT1_C);
   signal port_r, port_x : PortStateType := PORT0_C;
 
+  -- emulation of SdramCntl's pipeline registers to allow proper generation of status signals
+  signal rdPipeline0_r, rdPipeline0_x, rdPipeline1_r, rdPipeline1_x: std_logic_vector(CAS_CYCLES_C+1 downto 0) := (others => '0');
+  signal wrPipeline0_r, wrPipeline0_x, wrPipeline1_r, wrPipeline1_x: std_logic_vector(             0 downto 0) := (others => '0');
+
   signal switch_s                         : std_logic;  -- indicates that the active port should be switched.
-  signal inProgress_s                     : std_logic;  -- the active port has a read/write op in-progress.
   signal rd_s                             : std_logic;  -- read signal to the SDRAM controller (internal copy).
   signal wr_s                             : std_logic;  -- write signal to the SDRAM controller (internal copy).
   signal earlyOpBegun0_s, earlyOpBegun1_s : std_logic;  -- (internal copies).
@@ -1021,21 +1021,24 @@ begin
   data1_o <= data_i;
 
   -- send the SDRAM controller status to the active port and give the inactive port an inactive status code.
-  status0_o <= status_i when port_r = PORT0_C else "1111";
-  status1_o <= status_i when port_r = PORT1_C else "1111";
+  -- FIXME: I don't know how to handle these...
+  -- status0_o <= status_i when port_r = PORT0_C else "1111";
+  -- status1_o <= status_i when port_r = PORT1_C else "1111";
+  status0_o <= "1111";
+  status1_o <= "1111";
 
   -- either port can reset the SDRAM controller.
   rst_o <= rst0_i or rst1_i;
 
-  -- apply the read signal from the active port to the SDRAM controller only if the door is open..
-  rd_s <= rd0_i when (port_r = PORT0_C) and (door_r = OPENED_C) else
-          rd1_i when (port_r = PORT1_C) and (door_r = OPENED_C) else
+  -- apply the read signal from the active port to the SDRAM controller
+  rd_s <= rd0_i when port_r = PORT0_C else
+          rd1_i when port_r = PORT1_C else
           NO;
   rd_o <= rd_s;
 
-  -- apply the write signal from the active port to the SDRAM controller only if the door is open..
-  wr_s <= wr0_i when (port_r = PORT0_C) and (door_r = OPENED_C) else
-          wr1_i when (port_r = PORT1_C) and (door_r = OPENED_C) else
+  -- apply the write signal from the active port to the SDRAM controller
+  wr_s <= wr0_i when port_r = PORT0_C else
+          wr1_i when port_r = PORT1_C else
           NO;
   wr_o <= wr_s;
 
@@ -1044,12 +1047,12 @@ begin
   earlyOpBegun0_o <= earlyOpBegun0_s;
   earlyOpBegun1_s <= earlyOpBegun_i when port_r = PORT1_C else NO;
   earlyOpBegun1_o <= earlyOpBegun1_s;
-  rdPending0_o    <= rdPending_i    when port_r = PORT0_C else NO;
-  rdPending1_o    <= rdPending_i    when port_r = PORT1_C else NO;
-  done0_o         <= done_i         when port_r = PORT0_C else NO;
-  done1_o         <= done_i         when port_r = PORT1_C else NO;
-  rdDone0_o       <= rdDone_i       when port_r = PORT0_C else NO;
-  rdDone1_o       <= rdDone_i       when port_r = PORT1_C else NO;
+  rdPending0_o    <= YES            when rdPipeline0_r(rdPipeline0_r'high downto 1) /= 0 else NO;
+  rdPending1_o    <= YES            when rdPipeline1_r(rdPipeline1_r'high downto 1) /= 0 else NO;
+  done0_o         <= rdPipeline0_r(0) or wrPipeline0_r(0);
+  done1_o         <= rdPipeline1_r(0) or wrPipeline1_r(0);
+  rdDone0_o       <= rdPipeline0_r(0);
+  rdDone1_o       <= rdPipeline1_r(0);
 
   --*********************************************************************
   -- Indicate when the active port needs to be switched.  A switch occurs if
@@ -1063,14 +1066,6 @@ begin
   switch_s <= (rd0_i or wr0_i) when (port_r = PORT1_C) and (((rd1_i = NO) and (wr1_i = NO)) or (slot_r(0) = '0')) else
               (rd1_i or wr1_i) when (port_r = PORT0_C) and (((rd0_i = NO) and (wr0_i = NO)) or (slot_r(0) = '1')) else
               NO;
-
-  --*********************************************************************
-  -- Indicate when an operation on the active port is in-progress and
-  -- can't be interrupted by a switch to the other port.  (Only read operations
-  -- are looked at since write operations always complete in one cycle once they
-  -- are initiated.)
-  --*********************************************************************
-  inProgress_s <= rdPending_i or (rd_s and earlyOpBegun_i);
 
   --*********************************************************************
   -- Update the time-slot allocation shift-register.  The port with priority is indicated by the
@@ -1087,52 +1082,37 @@ begin
             (((port_r = PORT0_C) and (slot_r(0) = '0')) or ((port_r = PORT1_C) and (slot_r(0) = '1')))
             else slot_r;
 
+  -- update pipeline registers
+  rdPipeline0_x(rdPipeline0_x'high) <= YES when port_r = PORT0_C and rd0_i = YES and earlyOpBegun_i = YES else NO;
+  rdPipeline1_x(rdPipeline1_x'high) <= YES when port_r = PORT1_C and rd1_i = YES and earlyOpBegun_i = YES else NO;
+  wrPipeline0_x(wrPipeline0_x'high) <= YES when port_r = PORT0_C and wr0_i = YES and earlyOpBegun_i = YES else NO;
+  wrPipeline1_x(wrPipeline1_x'high) <= YES when port_r = PORT1_C and wr1_i = YES and earlyOpBegun_i = YES else NO;
+
+  rdPipeline0_x(rdPipeline0_x'high - 1 downto 0) <= rdPipeline0_r(rdPipeline0_r'high downto 1);
+  rdPipeline1_x(rdPipeline1_x'high - 1 downto 0) <= rdPipeline1_r(rdPipeline1_r'high downto 1);
+  wrPipeline0_x(wrPipeline0_x'high - 1 downto 0) <= wrPipeline0_r(wrPipeline0_r'high downto 1);
+  wrPipeline1_x(wrPipeline1_x'high - 1 downto 0) <= wrPipeline1_r(wrPipeline1_r'high downto 1);
+
   --*********************************************************************
   -- Determine which port will be active on the next cycle.  The active port is switched if:
   -- 1) there are no pending operations in progress, and
   -- 2) the port switch indicator is active.
   --*********************************************************************
-  port_process : process(port_r, inProgress_s, switch_s, done_i)
+  port_process : process(port_r, switch_s)
   begin
-    port_x <= port_r;  -- by default, the active port is not changed
+    port_x <= port_r; -- by default, the active port is not changed
     case port_r is
       when PORT0_C =>
-        if (inProgress_s = NO) and (switch_s = YES) then
+        if switch_s = YES then
           port_x <= PORT1_C;
         end if;
       when PORT1_C =>
-        if (inProgress_s = NO) and (switch_s = YES) then
+        if switch_s = YES then
           port_x <= PORT0_C;
         end if;
       when others =>
-        port_x <= port_r;
     end case;
   end process port_process;
-
-  --*********************************************************************
-  -- Determine if the door is open for the active port to initiate new R/W operations to
-  -- the SDRAM controller.  If the door is open and R/W operations are in progress but
-  -- a switch to the other port is indicated, then the door is closed to prevent any
-  -- further R/W operations from the active port.  The door is re-opened once all
-  -- in-progress operations are completed, at which time the switch to the other port
-  -- is also completed so it can issue its own R/W commands.
-  --*********************************************************************
-  door_process : process(door_r, inProgress_s, switch_s)
-  begin
-    door_x <= door_r;  -- by default, the door remains as it is.
-    case door_r is
-      when OPENED_C =>
-        if (inProgress_s = YES) and (switch_s = YES) then
-          door_x <= CLOSED_C;
-        end if;
-      when CLOSED_C =>
-        if inProgress_s = NO then
-          door_x <= OPENED_C;
-        end if;
-      when others =>
-        door_x <= door_r;
-    end case;
-  end process door_process;
 
   --*********************************************************************
   -- update registers on the appropriate clock edge.
@@ -1141,23 +1121,29 @@ begin
   begin
     if (rst0_i = YES) or (rst1_i = YES) then
       -- asynchronous reset.
-      door_r     <= CLOSED_C;
-      port_r     <= PORT0_C;
-      slot_r     <= PORT_TIME_SLOTS_G;
-      opBegun0_o <= NO;
-      opBegun1_o <= NO;
+      port_r        <= PORT0_C;
+      slot_r        <= PORT_TIME_SLOTS_G;
+      opBegun0_o    <= NO;
+      opBegun1_o    <= NO;
+      rdPipeline0_r <= (others => '0');
+      rdPipeline1_r <= (others => '0');
+      wrPipeline0_r <= (others => '0');
+      wrPipeline1_r <= (others => '0');
     elsif rising_edge(clk_i) then
-      door_r     <= door_x;
-      port_r     <= port_x;
-      slot_r     <= slot_x;
+      port_r        <= port_x;
+      slot_r        <= slot_x;
       --*********************************************************************
       -- opBegun signals are cycle-delayed versions of earlyOpBegun signals.
       -- We can't use the actual opBegun signal from the SDRAM controller
       -- because it would be turned off if the active port was switched on the
       -- cycle immediately after earlyOpBegun went active.
       --*********************************************************************
-      opBegun0_o <= earlyOpBegun0_s;
-      opBegun1_o <= earlyOpBegun1_s;
+      opBegun0_o    <= earlyOpBegun0_s;
+      opBegun1_o    <= earlyOpBegun1_s;
+      rdPipeline0_r <= rdPipeline0_x;
+      rdPipeline1_r <= rdPipeline1_x;
+      wrPipeline0_r <= wrPipeline0_x;
+      wrPipeline1_r <= wrPipeline1_x;
     end if;
   end process update;
 
