@@ -232,6 +232,9 @@ use IEEE.math_real.all;
 use XESS.CommonPckg.all;
 use work.XessBoardPckg.all;
 
+library unisim;
+use unisim.vcomponents.all;
+
 entity SdramCntl is
   generic(
     FREQ_G                 : real    := SDRAM_FREQ_C;  -- Operating frequency in MHz.
@@ -285,12 +288,10 @@ entity SdramCntl is
     );
 end entity;
 
-
-
 architecture arch of SdramCntl is
 
-  constant OUTPUT_C : std_logic := '1';  -- direction of dataflow w.r.t. this controller.
-  constant INPUT_C  : std_logic := '0';
+  constant OUTPUT_C : std_logic := '0';  -- direction of dataflow w.r.t. this controller.
+  constant INPUT_C  : std_logic := '1';
   constant NOP_C    : std_logic := '0';  -- no operation.
   constant READ_C   : std_logic := '1';  -- read operation.
   constant WRITE_C  : std_logic := '1';  -- write operation.
@@ -382,48 +383,145 @@ architecture arch of SdramCntl is
 
   -- registered outputs to host.
   signal opBegun_r, opBegun_x                     : std_logic                      := NO;  -- true when SDRAM read or write operation is started.
-  signal sdramData_r, sdramData_x                 : std_logic_vector(data_o'range) := (others => '0');  -- holds data read from SDRAM and sent to the host.
-  signal sdramDataOppPhase_r, sdramDataOppPhase_x : std_logic_vector(data_o'range);  -- holds data read from SDRAM on opposite clock edge.
+  signal sdramData_r                              : std_logic_vector(data_o'range) := (others => '0');  -- holds data read from SDRAM and sent to the host.
 
   -- registered outputs to SDRAM.
   signal cke_r, cke_x           : std_logic                         := NO;  -- Clock-enable bit.
   signal cmd_r, cmd_x           : SdramCmdType                      := NOP_CMD_C;  -- SDRAM command bits.
   signal ba_r, ba_x             : std_logic_vector(sdBs_o'range)    := (others => '0');  -- SDRAM bank address bits.
   signal sAddr_r, sAddr_x       : std_logic_vector(sdAddr_o'range)  := (others => '0');  -- SDRAM row/column address.
-  signal sData_r, sData_x       : std_logic_vector(sdData_io'range) := (others => '0');  -- SDRAM out databus.
-  signal sDataDir_r, sDataDir_x : std_logic                         := INPUT_C;  -- SDRAM databus direction control bit.
+  signal sData_x                : std_logic_vector(sdData_io'range) := (others => '0');  -- SDRAM out databus.
+  signal sDataDir_x             : std_logic                         := INPUT_C;  -- SDRAM databus direction control bit.
+
+  signal baOBuf_s: std_logic_vector(sdBs_o'range);
 
 begin
 
+  ba_obuf: for i in sdBs_o'range generate
+    fdce_inst: FDRSE generic map (
+      INIT => '0'
+    ) port map (
+      Q    => baOBuf_s(i),
+      C    => clk_i,
+      CE   => '1',
+      D    => ba_x(i),
+      R    => rst_i,
+      S    => '0'
+    );
+
+    obuf_inst: OBUF port map (
+      I    => baOBuf_s(i),
+      O    => sdBs_o(i)
+    );
+  end generate;
+
+  data_iobuf: for i in sdData_io'range generate
+    buf_block: block
+      signal t_s: std_logic;
+      signal o_s: std_logic;
+      signal i_s: std_logic;
+
+      signal i0_s: std_logic;
+      signal clk_not_s: std_logic;
+
+    begin
+      tff_inst: FDRSE generic map (
+        INIT => '1'
+      ) port map (
+        Q    => t_s,
+        C    => clk_i,
+        CE   => '1',
+        D    => sDataDir_x,
+        R    => '0',
+        S    => rst_i
+      );
+
+      off_inst: FDRSE generic map (
+        INIT => '0'
+      ) port map (
+        Q    => o_s,
+        C    => clk_i,
+        CE   => '1',
+        D    => sData_x(i),
+        R    => rst_i,
+        S    => '0'
+      );
+
+      iobuf_inst: IOBUF port map (
+        O    => i_s,
+        IO   => sdData_io(i),
+        I    => o_s,
+        T    => t_s
+      );
+
+      iff_in_phase: if IN_PHASE_G generate
+        iff_inst: FDRSE generic map (
+          INIT => '0'
+        ) port map (
+          Q    => sdramData_r(i),
+          C    => clk_i,
+          CE   => rdPipeline_r(1),
+          D    => i_s,
+          R    => rst_i,
+          S    => '0'
+        );
+      end generate;
+
+      iff_out_of_phase: if not IN_PHASE_G generate
+        clk_not_s <= not clk_i;
+
+        iff0_inst: FDRSE generic map (
+          INIT => '0'
+        ) port map (
+          Q    => i0_s,
+          C    => clk_not_s,
+          CE   => rdPipeline_r(1),
+          D    => i_s,
+          R    => rst_i,
+          S    => '0'
+        );
+
+        iff1_inst: FDRSE generic map (
+          INIT => '0'
+        ) port map (
+          Q    => sdramData_r(i),
+          C    => clk_i,
+          CE   => rdPipeline_r(1),
+          D    => i0_s,
+          R    => rst_i,
+          S    => '0'
+        );
+      end generate;
+    end block;
+  end generate;
+
   --*********************************************************************
-  -- attach some internal signals to the I/O ports 
+  -- attach some internal signals to the I/O ports
   --*********************************************************************
 
   -- attach registered SDRAM control signals to SDRAM input pins
   (sdCe_bo, sdRas_bo, sdCas_bo, sdWe_bo, sdDqmh_o, sdDqml_o) <= cmd_r;  -- SDRAM operation control bits
   sdCke_o                                                    <= cke_r;  -- SDRAM clock enable
-  sdBs_o                                                     <= ba_r;  -- SDRAM bank address
   sdAddr_o                                                   <= sAddr_r;  -- SDRAM address
-  sdData_io                                                  <= sData_r when sDataDir_r = OUTPUT_C else (others => 'Z');  -- SDRAM output data bus
   -- attach some port signals
   data_o                                                     <= sdramData_r;  -- data back to host
   opBegun_o                                                  <= opBegun_r;  -- true if requested operation has begun
 
 
   --*********************************************************************
-  -- compute the next state and outputs 
+  -- compute the next state and outputs
   --*********************************************************************
 
-  combinatorial : process(rd_i, wr_i, addr_i, data_i, sdramData_r, sdData_io, state_r, opBegun_x,
+  combinatorial : process(rd_i, wr_i, addr_i, data_i, sdramData_r, state_r, opBegun_x,
                           activeFlag_r, activeRow_r, activeBank_r, rdPipeline_r, wrPipeline_r,
-                          sdramDataOppPhase_r, nopCntr_r, lock_i, rfshCntr_r, timer_r, rasTimer_r,
-                          wrTimer_r, refTimer_r, cmd_r, col_s, row_s, bank_s, bankIndex_s, ba_r,
-                          ba_x, cke_r, doActivate_s, doSelfRfsh_s, activateInProgress_s,
+                          nopCntr_r, lock_i, rfshCntr_r, timer_r, rasTimer_r,
+                          wrTimer_r, refTimer_r, col_s, row_s, bank_s, bankIndex_s, ba_r,
+                          ba_x, doActivate_s, doSelfRfsh_s, activateInProgress_s,
                           rdInProgress_s, wrInProgress_s)
   begin
 
     --*********************************************************************
-    -- setup default values for signals 
+    -- setup default values for signals
     --*********************************************************************
 
     opBegun_x      <= NO;               -- no operations have begun
@@ -439,7 +537,7 @@ begin
     rfshCntr_x     <= rfshCntr_r;
 
     --*********************************************************************
-    -- setup default value for the SDRAM address 
+    -- setup default value for the SDRAM address
     --*********************************************************************
 
     -- extract bank field from host address
@@ -466,7 +564,7 @@ begin
     --*********************************************************************
 
     -- determine if read operations are in progress by the presence of
-    -- READ flags in the read pipeline 
+    -- READ flags in the read pipeline
     if rdPipeline_r(rdPipeline_r'high downto 1) /= 0 then
       rdInProgress_s <= YES;
     else
@@ -477,23 +575,6 @@ begin
     -- enter NOPs into the read and write pipeline shift registers by default
     rdPipeline_x    <= NOP_C & rdPipeline_r(rdPipeline_r'high downto 1);
     wrPipeline_x(0) <= NOP_C;
-
-    -- transfer data from SDRAM to the host data register if a read flag has exited the pipeline
-    -- (the transfer occurs 1 cycle before we tell the host the read operation is done)
-    if rdPipeline_r(1) = READ_C then
-      sdramDataOppPhase_x <= sdData_io(data_o'range);  -- gets value on the SDRAM databus on the opposite phase
-      if IN_PHASE_G then
-        -- get the SDRAM data for the host directly from the SDRAM if the controller and SDRAM are in-phase
-        sdramData_x <= sdData_io(data_o'range);
-      else
-        -- otherwise get the SDRAM data that was gathered on the previous opposite clock edge
-        sdramData_x <= sdramDataOppPhase_r(data_o'range);
-      end if;
-    else
-      -- retain contents of host data registers if no data from the SDRAM has arrived yet
-      sdramDataOppPhase_x <= sdramDataOppPhase_r;
-      sdramData_x         <= sdramData_r;
-    end if;
 
     done_o   <= rdPipeline_r(0) or wrPipeline_r(0);  -- a read or write operation is done
     rdDone_o <= rdPipeline_r(0);  -- SDRAM data available when a READ flag exits the pipeline 
@@ -521,7 +602,7 @@ begin
       nopCntr_x    <= 0;
       doSelfRfsh_s <= NO;
     elsif nopCntr_r /= MAX_NOP_G then
-      -- increment NOP counter whenever there is no read or write operation 
+      -- increment NOP counter whenever there is no read or write operation
       nopCntr_x    <= nopCntr_r + 1;
       doSelfRfsh_s <= NO;
     else
@@ -531,7 +612,7 @@ begin
     end if;
 
     --*********************************************************************
-    -- update the timers 
+    -- update the timers
     --*********************************************************************
 
     -- row activation timer
@@ -547,7 +628,7 @@ begin
       activateInProgress_s <= NO;
     end if;
 
-    -- write operation timer            
+    -- write operation timer
     if wrTimer_r /= 0 then
       -- decrement a non-zero timer and set the flag
       -- to indicate the write operation is still inprogress
@@ -560,7 +641,7 @@ begin
       wrInPRogress_s <= NO;
     end if;
 
-    -- refresh timer            
+    -- refresh timer
     if refTimer_r /= 0 then
       refTimer_x <= refTimer_r - 1;
     else
@@ -574,7 +655,7 @@ begin
       end if;
     end if;
 
-    -- main timer for sequencing SDRAM operations               
+    -- main timer for sequencing SDRAM operations
     if timer_r /= 0 then
       -- decrement the timer and do nothing else since the previous operation has not completed yet.
       timer_x  <= timer_r - 1;
@@ -584,7 +665,7 @@ begin
       timer_x <= timer_r;               -- by default, leave the timer at zero
 
       --*********************************************************************
-      -- compute the next state and outputs 
+      -- compute the next state and outputs
       --*********************************************************************
       case state_r is
 
@@ -816,9 +897,6 @@ begin
       cmd_r        <= NOP_CMD_C;
       ba_r         <= (others => '0');
       sAddr_r      <= (others => '0');
-      sData_r      <= (others => '0');
-      sDataDir_r   <= INPUT_C;
-      sdramData_r  <= (others => '0');
     elsif rising_edge(clk_i) then
       state_r      <= state_x;
       activeBank_r <= activeBank_x;
@@ -837,17 +915,6 @@ begin
       cmd_r        <= cmd_x;
       ba_r         <= ba_x;
       sAddr_r      <= sAddr_x;
-      sData_r      <= sData_x;
-      sDataDir_r   <= sDataDir_x;
-      sdramData_r  <= sdramData_x;
-    end if;
-
-    -- The register that gets data from the SDRAM and holds it for the host
-    -- is clocked on the opposite edge.  We don't use this register if IN_PHASE_G=TRUE.
-    if rst_i = YES then
-      sdramDataOppPhase_r <= (others => '0');
-    elsif falling_edge(clk_i) then
-      sdramDataOppPhase_r <= sdramDataOppPhase_x;
     end if;
 
   end process update;
