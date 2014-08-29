@@ -18,7 +18,7 @@
 --**********************************************************************
 
 --**********************************************************************
--- This module provides a coounication interface between a host PC and 
+-- This module provides a communication interface between a host PC and 
 -- a module in the FPGA that operates as follows:
 --
 -- 1. A Python program on the host PC issues commands for reading or
@@ -54,7 +54,7 @@
 --**********************************************************************
 
 
-library IEEE, XESS;
+  library IEEE, XESS;
 use IEEE.std_logic_1164.all;
 use IEEE.math_real.all;
 use XESS.CommonPckg.all;
@@ -70,17 +70,17 @@ package HostIoCommPckg is
       FPGA_DEVICE_G      : FpgaFamily_t     := FPGA_FAMILY_C;  -- FPGA device type.
       TAP_USER_INSTR_G   : TapUserInstr_t   := TAP_USER_INSTR_C;  -- USER instruction this module responds to.
       SIMPLE_G           : boolean          := false;  -- If true, include BscanToHostIo module in this module.
-      FIFO_LENGTH_G      : natural          := 16; -- Number of data words in the Up and Down FIFOs.
-      WORD_WIDTH_G       : natural          := 8 -- Number of bits in each FIFO word.
+      FIFO_LENGTH_G      : natural          := 16;  -- Number of data words in the Up and Down FIFOs.
+      WORD_WIDTH_G       : natural          := 8  -- Number of bits in each FIFO word.
       );
     port (
       reset_i     : in  std_logic := LO;  -- Active-high reset signal.
-      clk_i       : in  std_logic;        -- Master clock.
+      clk_i       : in  std_logic;      -- Master clock.
       -- Interface to BscanHostIo. (Used only if SIMPLE_G is false.)
       inShiftDr_i : in  std_logic := LO;  -- True when USER JTAG instruction is active and the TAP FSM is in the Shift-DR state.
       drck_i      : in  std_logic := LO;  -- Bit clock. TDI clocked in on rising edge, TDO sampled on falling edge.
       tdi_i       : in  std_logic := LO;  -- Bit from the host to the memory.
-      tdo_o       : out std_logic;        -- Bit from the memory to the host.
+      tdo_o       : out std_logic;      -- Bit from the memory to the host.
       -- FPGA-side interface.
       add_i       : in  std_logic;  -- Add data to the Up FIFO that sends data to the host.
       data_i      : in  std_logic_vector(WORD_WIDTH_G-1 downto 0);  -- Data to send to the host.
@@ -93,7 +93,38 @@ package HostIoCommPckg is
       dnFull_o    : out std_logic;  -- True if the Down FIFO from the host is full.
       dnLevel_o   : out std_logic_vector(natural(ceil(log2(real(FIFO_LENGTH_G+1))))-1 downto 0)  -- # of data words available in the Down FIFO from the host.
       );
-    end component;
+  end component;
+
+  component WbHostUart is
+    generic (
+      ID_G               : std_logic_vector := "11111111";  -- The ID this module responds to.
+      VENDOR_ID_G        : std_logic_vector := x"08";  -- ZPUino.
+      PRODUCT_ID_G       : std_logic_vector := x"11";  -- UART.
+      PYLD_CNTR_LENGTH_G : natural          := 32;  -- Length of payload bit counter.
+      SIMPLE_G           : boolean          := false;  -- If true, include BscanToHostIo module in this module.
+      WORD_WIDTH_G       : natural          := 8;  -- Width of data word sent to/from the host.
+      FIFO_LENGTH_G      : natural          := 16  -- Number of data words in the Up and Down FIFOs.
+      );
+    port (
+      -- Wishbone interface.
+      wb_clk_i    : in  std_logic;
+      wb_rst_i    : in  std_logic;
+      wb_dat_o    : out std_logic_vector;
+      wb_dat_i    : in  std_logic_vector;
+      wb_adr_i    : in  std_logic_vector;
+      wb_we_i     : in  std_logic;
+      wb_cyc_i    : in  std_logic;
+      wb_stb_i    : in  std_logic;
+      wb_ack_o    : out std_logic;
+      wb_inta_o   : out std_logic;
+      id          : out std_logic_vector;
+      -- Interface to BscanHostIo. (Used only if SIMPLE_G is false.)
+      inShiftDr_i : in  std_logic := LO;
+      drck_i      : in  std_logic := LO;
+      tdi_i       : in  std_logic := LO;
+      tdo_o       : out std_logic
+      );
+  end component;
 
 end package;
 
@@ -107,6 +138,7 @@ use IEEE.math_real.all;
 use XESS.CommonPckg.all;
 use XESS.HostIoPckg.all;
 use XESS.FifoPckg.all;
+use xess.DelayPckg.all;
 use work.XessBoardPckg.all;
 
 entity HostIoComm is
@@ -116,8 +148,8 @@ entity HostIoComm is
     FPGA_DEVICE_G      : FpgaFamily_t     := FPGA_FAMILY_C;  -- FPGA device type.
     TAP_USER_INSTR_G   : TapUserInstr_t   := TAP_USER_INSTR_C;  -- USER instruction this module responds to.
     SIMPLE_G           : boolean          := false;  -- If true, include BscanToHostIo module in this module.
-    FIFO_LENGTH_G      : natural          := 16; -- Number of data words in the Up and Down FIFOs.
-    WORD_WIDTH_G       : natural          := 8 -- Number of bits in each FIFO word.
+    FIFO_LENGTH_G      : natural          := 16;  -- Number of data words in the Up and Down FIFOs.
+    WORD_WIDTH_G       : natural          := 8  -- Number of bits in each FIFO word.
     );
   port (
     reset_i     : in  std_logic := LO;  -- Active-high reset signal.
@@ -143,25 +175,29 @@ end entity;
 
 
 architecture arch of HostIoComm is
-  signal hostReset_s   : std_logic;     -- Reset signal issued from host.
-  signal reset_s       : std_logic;  -- OR combination of host-side and FPGA-side resets.
+  signal hostReset_s    : std_logic;    -- Reset signal issued from host.
+  signal reset_s        : std_logic;  -- OR combination of host-side and FPGA-side resets.
   type RegAddr_t is (FIFO_REG, STATUS_CONTROL_REG, DN_FREE_REG, UP_USED_REG);
-  signal regAddr_s     : std_logic_vector(2 downto 0);  -- Register address from host.
-  signal wr_s          : std_logic; -- Write signal from host.
-  signal rd_s          : std_logic; -- Read signal from host.
-  signal done_s        : std_logic; -- Host read/write done signal.
-  signal upRmv_s       : std_logic; -- Remove data from the front of the Up FIFO.
-  signal upEmpty_s     : std_logic; -- True if Up FIFO is empty.
-  signal upFull_s      : std_logic; -- True if Up FIFO is full.
-  signal upLevel_s     : std_logic_vector(upLevel_o'range); -- # of data words in Up FIFO.
-  signal dnAdd_s       : std_logic; -- Add data to back of Down FIFO.
-  signal dnEmpty_s     : std_logic; -- True if Down FIFO is empty.
-  signal dnFull_s      : std_logic; -- True if Down FIFO is full.
-  signal dnLevel_s     : std_logic_vector(dnLevel_o'range); -- # of data words in Down FIFO.
-  signal busFromHost_s : std_logic_vector(WORD_WIDTH_G-1 downto 0);  -- Data from host to FPGA.
-  signal busToHost_s   : std_logic_vector(WORD_WIDTH_G-1 downto 0);  -- Data from FPGA to host.
-  signal upFront_s     : std_logic_vector(WORD_WIDTH_G-1 downto 0);  -- Data from Up FIFO to host.
-  
+  signal regAddr_s      : std_logic_vector(2 downto 0);  -- Register address from host.
+  signal wr_s           : std_logic;    -- Write signal from host.
+  signal rd_s           : std_logic;    -- Read signal from host.
+  signal done_s         : std_logic;    -- Host read/write done signal.
+  signal upRmv_s        : std_logic;  -- Remove data from the front of the Up FIFO.
+  signal upRmvDelayed_s : std_logic;  -- Remove data from the front of the Up FIFO after read is done.
+  signal upEmpty_s      : std_logic;    -- True if Up FIFO is empty.
+  signal upFull_s       : std_logic;    -- True if Up FIFO is full.
+  signal upLevel_s      : std_logic_vector(upLevel_o'range);  -- # of data words in Up FIFO.
+  signal dnAdd_s        : std_logic;    -- Add data to back of Down FIFO.
+  signal dnEmpty_s      : std_logic;    -- True if Down FIFO is empty.
+  signal dnFull_s       : std_logic;    -- True if Down FIFO is full.
+  signal dnLevel_s      : std_logic_vector(dnLevel_o'range);  -- # of data words in Down FIFO.
+  signal busFromHost_s  : std_logic_vector(WORD_WIDTH_G-1 downto 0);  -- Data from host to FPGA.
+  signal busToHost_s    : std_logic_vector(WORD_WIDTH_G-1 downto 0);  -- Data from FPGA to host.
+  signal upFront_s      : std_logic_vector(WORD_WIDTH_G-1 downto 0);  -- Data from Up FIFO to host.
+  signal dnEmptySel_s   : std_logic;  -- True when the amount of free space in the Up FIFO is read.
+  signal upFilledSel_s  : std_logic;  -- True when the amount of used space in the Down FIFO is read.
+  signal dnEmptySR_r    : std_logic_vector(31 downto 0);  -- Holds amount of free space in the Down FIFO.
+  signal upFilledSR_r   : std_logic_vector(31 downto 0);  -- Holds amount of used space in the Up FIFO.
 begin
 
   -- Reset this module from the FPGA-side or the host-side.
@@ -197,33 +233,93 @@ begin
       done_i         => done_s  -- True when the read or write is completed.
       );
 
-  -- FIFO operations are done within a single cycle after they are initiated by the host.
-  done_s <= rd_s or wr_s;
+  -- FIFO R/W operations are done a single cycle after they are initiated by the host.
+  uDoneDelay : delayLine
+    generic map(NUM_DELAY_CYCLES_G => 1)
+    port map(clk_i                 => clk_i, a_i => (rd_s or wr_s), aDelayed_o => done_s);
 
-  -- Decode the register address from the host to perform the right comm channel operations.
+  -- Decode the register address from the host to initiate the correct comm channel operations.
   RegAddrDecoder : process(regAddr_s, rd_s, wr_s, upFront_s, upEmpty_s, upFull_s, upLevel_s, dnEmpty_s, dnFull_s, dnLevel_s)
   begin
     -- Default control signal values to prevent latches from being synthesized.
-    upRmv_s     <= LO; -- Don't remove the data at the front of the Up FIFO.
-    dnAdd_s     <= LO; -- Don't add data to the back of the Down FIFO.
-    hostReset_s <= LO; -- Don't reset the FIFOs.
-    busToHost_s <= (others => '0'); -- Default the data to the host to zero.
-    
+    upRmv_s       <= LO;  -- Don't remove the data at the front of the Up FIFO.
+    dnAdd_s       <= LO;  -- Don't add data to the back of the Down FIFO.
+    hostReset_s   <= LO;                -- Don't reset the FIFOs.
+    busToHost_s   <= (others => '0');  -- Default the data to the host to zero.
+    dnEmptySel_s  <= LO;
+    upFilledSel_s <= LO;
+
     case RegAddr_t'val(TO_INTEGER(unsigned(regAddr_s))) is
-      when FIFO_REG => -- Host add/remove data to/from the Down/Up FIFOs.
-        dnAdd_s     <= wr_s; -- A write by the host adds data from the host to the Down FIFO.
-        upRmv_s     <= rd_s; -- A read by the host removes data from the front of the Up FIFO.
-        busToHost_s <= upFront_s; -- Send the data at the front of the Up FIFO to the host.
-      when STATUS_CONTROL_REG => -- Host read of FIFO statuses or reset of the FIFOs.
-        busToHost_s(3 downto 0) <= upFull_s & upEmpty_s & dnFull_s & dnEmpty_s; -- A read by the host gets the FIFO statuses.
-        hostReset_s             <= wr_s; -- A write by the host to this address resets the FIFOs.
-      when DN_FREE_REG => -- Host reads the # of available slots for additional data in the Down FIFO.
-        busToHost_s <= std_logic_vector(TO_UNSIGNED(FIFO_LENGTH_G - TO_INTEGER(unsigned(dnLevel_s)), busToHost_s'length));
-      when UP_USED_REG => -- Host reads the # of filled slots waiting in the Up FIFO for xfer to the host.
-        busToHost_s <= std_logic_vector(TO_UNSIGNED(TO_INTEGER(unsigned(upLevel_s)), busToHost_s'length));
+      when FIFO_REG =>     -- Host add/remove data to/from the Down/Up FIFOs.
+        dnAdd_s     <= wr_s;  -- A write by the host adds data from the host to the Down FIFO.
+        upRmv_s     <= rd_s;  -- A read by the host removes data from the front of the Up FIFO.
+        busToHost_s <= upFront_s;  -- Send the data at the front of the Up FIFO to the host.
+      when STATUS_CONTROL_REG =>  -- Host read of FIFO statuses or reset of the FIFOs.
+        busToHost_s(3 downto 0) <= upFull_s & upEmpty_s & dnFull_s & dnEmpty_s;  -- A read by the host gets the FIFO statuses.
+        hostReset_s             <= wr_s;  -- A write by the host to this address resets the FIFOs.
+      when DN_FREE_REG =>  -- Host reads the # of available slots for additional data in the Down FIFO.
+        busToHost_s  <= dnEmptySR_r(busToHost_s'range);
+        dnEmptySel_s <= rd_s;  -- Only select the Down FIFO free-amount register if it is being read.
+      when UP_USED_REG =>  -- Host reads the # of filled slots waiting in the Up FIFO for xfer to the host.
+        busToHost_s   <= upFilledSR_r(busToHost_s'range);
+        upFilledSel_s <= rd_s;  -- Only select the Up FIFO filled-amount register if it is being read.
       when others =>
         null;
     end case;
+  end process;
+
+  -- Shift register that holds the amount of empty space in the Down FIFO and dispenses it one word at a time.
+  -- This is necessary because the width of the bus going back to the host may be too small to transfer the
+  -- count in a single transfer.
+  DownEmptySReg : process(clk_i)
+    variable shiftEnable_v : std_logic := NO;  -- Enable register shifting using the delayed dnEmptySel_s signal.
+    variable cnt_v         : natural range 0 to dnEmptySR_r'length;  -- Counts the # of bits left to shift out.
+  begin
+    if rising_edge(clk_i) then
+      if reset_s = YES then  -- Upon reset, amount of free space equals the size of the FIFO.
+        cnt_v := 0;
+      elsif cnt_v = 0 then  -- Reload the shift reg with current FIFO level after it is read or not selected.
+        dnEmptySR_r                          <= (others => ZERO);
+        dnEmptySR_r(dnLevel_s'high downto 0) <= std_logic_vector(TO_UNSIGNED(FIFO_LENGTH_G - TO_INTEGER(unsigned(dnLevel_s)), dnLevel_s'length));
+        cnt_v                                := dnEmptySR_r'length;
+      elsif done_s = YES then  -- Update the shift register after any read or write.
+        if shiftEnable_v = YES then  -- Shift this register by WORD_WIDTH bits whenever it is selected for reading.
+          dnEmptySR_r                                         <= (others => ZERO);  -- Shift in zeroes.
+          dnEmptySR_r(dnEmptySR_r'high-WORD_WIDTH_G downto 0) <= dnEmptySR_r(dnEmptySR_r'high downto WORD_WIDTH_G);
+          cnt_v                                               := cnt_v - WORD_WIDTH_G;  -- Reduce the bit counter by the number of bits shifted out.
+        else
+          cnt_v := 0;       -- Causes the shift register to be reloaded.
+        end if;
+      end if;
+      shiftEnable_v := dnEmptySel_s;  -- This 1-cycle delay makes the shift enable coincide with the done signal.
+    end if;
+  end process;
+
+  -- Shift register that holds the amount of space used in the Up FIFO and dispenses it one word at a time.
+  -- This is necessary because the width of the bus going back to the host may be too small to transfer the
+  -- count in a single transfer.
+  UpFilledSReg : process(clk_i)
+    variable shiftEnable_v : std_logic := NO;  -- Enable register shifting using the delayed upFilledSel_s signal.
+    variable cnt_v         : natural range 0 to upFilledSR_r'length;  -- Counts the # of bits left to shift out.
+  begin
+    if rising_edge(clk_i) then
+      if reset_s = YES then  -- Upon reset, the Up FIFO is emptied and the filled space is zero.
+        cnt_v := 0;
+      elsif cnt_v = 0 then  -- Reload the shift reg with current FIFO level after it is read or not selected.
+        upFilledSR_r                          <= (others => ZERO);
+        upFilledSR_r(upLevel_s'high downto 0) <= upLevel_s;
+        cnt_v                                 := upFilledSR_r'length;
+      elsif done_s = YES then  -- Update the shift register after any read or write.
+        if shiftEnable_v = YES then  -- Shift this register by WORD_WIDTH bits whenever it is selected for reading.
+          upFilledSR_r                                          <= (others => ZERO);  -- Shift in zeroes.
+          upFilledSR_r(upFilledSR_r'high-WORD_WIDTH_G downto 0) <= upFilledSR_r(upFilledSR_r'high downto WORD_WIDTH_G);
+          cnt_v                                                 := cnt_v - WORD_WIDTH_G;  -- Reduce the bit counter by the number of bits shifted out.
+        else
+          cnt_v := 0;       -- Causes the shift register to be reloaded.
+        end if;
+      end if;
+      shiftEnable_v := upFilledSel_s;  -- This 1-cycle delay makes the shift enable coincide with the done signal.
+    end if;
   end process;
 
   -- The Down FIFO takes data from the host and delivers it to the FPGA module.
@@ -244,6 +340,11 @@ begin
       level_o => dnLevel_s
       );
 
+  -- Delay removal of the data from the upload FIFO until the host has a chance to read it.
+  uRmvDelay : delayLine
+    generic map(NUM_DELAY_CYCLES_G => 1)
+    port map(clk_i                 => clk_i, a_i => upRmv_s, aDelayed_o => upRmvDelayed_s);
+
   -- The Up FIFO takes data from the FPGA module and delivers it to the host.
   UpFifo : FifoCc
     generic map(
@@ -255,7 +356,7 @@ begin
       clk_i   => clk_i,
       add_i   => add_i,
       data_i  => data_i,
-      rmv_i   => upRmv_s,
+      rmv_i   => upRmvDelayed_s,
       data_o  => upFront_s,
       full_o  => upFull_s,
       empty_o => upEmpty_s,
@@ -269,6 +370,135 @@ begin
   dnFull_o  <= dnFull_s;
   dnEmpty_o <= dnEmpty_s;
   dnLevel_o <= dnLevel_s;
+
+end architecture;
+
+
+
+
+--**********************************************************************
+-- HostIoComm with Wishbone interface to the FPGA.
+--   Address    Function
+--      0       Read data from the UART RX queue.
+--              Write data to the UART TX queue.
+--      1       Read status: Bit 0: True if UART RX queue has data waiting.
+--                           Bit 1: True if UART TX queue is full.
+--              Write control: No control bits.
+--**********************************************************************
+
+library IEEE, XESS;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+use xess.CommonPckg.all;
+use xess.HostIoCommPckg.all;
+use work.XessboardPckg.all;
+
+entity WbHostUart is
+  generic (
+    ID_G               : std_logic_vector := "11111111";  -- The ID this module responds to.
+    VENDOR_ID_G        : std_logic_vector := x"08";  -- ZPUino.
+    PRODUCT_ID_G       : std_logic_vector := x"11";  -- UART.
+    PYLD_CNTR_LENGTH_G : natural          := 32;  -- Length of payload bit counter.
+    SIMPLE_G           : boolean          := false;  -- If true, include BscanToHostIo module in this module.
+    WORD_WIDTH_G       : natural          := 8;  -- Width of data word sent to/from the host.
+    FIFO_LENGTH_G      : natural          := 16  -- Number of data words in the Up and Down FIFOs.
+    );
+  port (
+    -- Wishbone interface.
+    wb_clk_i    : in  std_logic;
+    wb_rst_i    : in  std_logic;
+    wb_dat_o    : out std_logic_vector;
+    wb_dat_i    : in  std_logic_vector;
+    wb_adr_i    : in  std_logic_vector;
+    wb_we_i     : in  std_logic;
+    wb_cyc_i    : in  std_logic;
+    wb_stb_i    : in  std_logic;
+    wb_ack_o    : out std_logic;
+    wb_inta_o   : out std_logic;
+    id          : out std_logic_vector;
+    -- Interface to BscanHostIo. (Used only if SIMPLE_G is false.)
+    inShiftDr_i : in  std_logic := LO;
+    drck_i      : in  std_logic := LO;
+    tdi_i       : in  std_logic := LO;
+    tdo_o       : out std_logic
+    );
+end entity;
+
+architecture arch of WbHostUart is
+  signal wbActive_s : std_logic;  -- True when this device is read/written over Wishbone bus.
+  signal rmv_s      : std_logic;  -- True when data is being removed from the download FIFO from the host.
+  signal add_s      : std_logic;  -- True when data is being added to the upload FIFO to the host.
+  signal dnData_s   : std_logic_vector(7 downto 0);  -- Data from the download FIFO.
+  signal dnEmpty_s  : std_logic;  -- True when the download FIFO from the host is empty.
+  signal upFull_s   : std_logic;  -- True when the upload FIFO to the host is full.
+begin
+
+  id <= VENDOR_ID_G & PRODUCT_ID_G;  -- Output the vendor and product IDs so the ZPUino can identify it.
+
+  wbActive_s <= wb_cyc_i and wb_stb_i;  -- True when this device is read/written over Wishbone bus.
+
+  wb_inta_o <= NO;                      -- No interrupts come from this module.
+  wb_ack_o  <= wbActive_s;  -- Immediately acknowledge any read or write operation.
+
+  process(wbActive_s, wb_adr_i, wb_we_i, dnData_s, dnEmpty_s, upFull_s)
+  begin
+    -- Set default values for these signals when this device is not being read/written.
+    rmv_s    <= NO;
+    add_s    <= NO;
+    wb_dat_o <= (others => '0');
+
+    if wbActive_s = YES then            -- This device is being accessed.
+      if wb_we_i = YES then             -- Write UART operation.
+        case wb_adr_i(2) is
+          when '0' =>                   -- Write UART TX register.
+            add_s <= YES;  -- Write data from ZPUino to FIFO uploaded to the host.
+          when '1' =>                   -- Write UART control register.
+            null;          -- There's no control bits for this UART.
+          when others =>
+            null;
+        end case;
+      else                              -- Read UART operation.
+        case wb_adr_i(2) is
+          when '0' =>                   -- Read UART RX register.
+            rmv_s                <= YES;  -- Read data from FIFO downloaded from the host.
+            wb_dat_o             <= (others => '0');
+            wb_dat_o(7 downto 0) <= dnData_s;
+          when '1' =>                   -- Read UART status register.
+            wb_dat_o    <= (others => '0');
+            wb_dat_o(0) <= not dnEmpty_s;  -- RX data is available if download FIFO is not empty.
+            wb_dat_o(1) <= upFull_s;  -- Indicate TX is busy if upload FIFO is full.
+            wb_dat_o(2) <= NO;          -- TX is never "in transmit".
+          when others =>
+            null;
+        end case;
+      end if;
+    end if;
+  end process;
+
+  u0 : HostIoComm
+    generic map(
+      ID_G               => ID_G,
+      PYLD_CNTR_LENGTH_G => PYLD_CNTR_LENGTH_G,
+      SIMPLE_G           => SIMPLE_G,
+      FIFO_LENGTH_G      => FIFO_LENGTH_G,
+      WORD_WIDTH_G       => WORD_WIDTH_G
+      )
+    port map(
+      reset_i     => wb_rst_i,
+      clk_i       => wb_clk_i,
+      -- Interface to BscanHostIo. (Used only if SIMPLE_G is false.)
+      inShiftDr_i => inShiftDr_i,
+      drck_i      => drck_i,
+      tdi_i       => tdi_i,
+      tdo_o       => tdo_o,
+      -- FPGA-side interface.
+      add_i       => add_s,             -- Add data to upload FIFO.
+      data_i      => wb_dat_i(7 downto 0),  -- Data to upload to host via USB.
+      upFull_o    => upFull_s,          -- Upload FIFO to host is full.
+      rmv_i       => rmv_s,             -- Remove data from download FIFO.
+      data_o      => dnData_s,          -- Data downloaded from host via USB.
+      dnEmpty_o   => dnEmpty_s          -- Download FIFO from host is empty.
+      );
 
 end architecture;
 
@@ -326,7 +556,7 @@ begin
   -- Instantiate the communication interface.
   u1 : HostIoComm
     generic map(
-      SIMPLE_G => true,
+      SIMPLE_G      => true,
       FIFO_LENGTH_G => 64
       )
     port map(
@@ -354,21 +584,21 @@ begin
         data_r  <= "00001010";
       else
         case state_r is
-          when FILL_WITH_DATA => -- Init the Down FIFO with some data.
+          when FILL_WITH_DATA =>        -- Init the Down FIFO with some data.
             dataToHost_s <= data_r;
             data_r       <= data_r + 1;
             wr_s         <= HI;
             if data_r = 30 then
               state_r <= CHANGE_DATA;
             end if;
-          when CHANGE_DATA => -- Read from the Down FIFO and write to the Up FIFO.
+          when CHANGE_DATA =>  -- Read from the Down FIFO and write to the Up FIFO.
             if (empty_s = NO) and (full_s = NO) then
-              dataToHost_s <= unsigned(dataFromHost_s) + 3; -- Alter the data.
+              dataToHost_s <= unsigned(dataFromHost_s) + 3;  -- Alter the data.
               wr_s         <= HI;
               rd_s         <= HI;
               state_r      <= WAIT_FOR_STATUS;
             end if;
-          when WAIT_FOR_STATUS => -- Wait for the FIFO empty/full statuses to update.
+          when WAIT_FOR_STATUS =>  -- Wait for the FIFO empty/full statuses to update.
             state_r <= CHANGE_DATA;
         end case;
       end if;
